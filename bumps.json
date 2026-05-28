@@ -1,0 +1,39 @@
+{
+  "P001": [
+    {
+      "id": "B0001",
+      "timestamp": "2026-05-27T21:59:27.484989+00:00",
+      "reason": "survey_incomplete",
+      "note": "",
+      "read": true
+    },
+    {
+      "id": "B0002",
+      "timestamp": "2026-05-27T21:59:36.068164+00:00",
+      "reason": "sensor_off",
+      "note": "",
+      "read": true
+    },
+    {
+      "id": "B0003",
+      "timestamp": "2026-05-27T21:59:40.917722+00:00",
+      "reason": "sensor_off",
+      "note": "",
+      "read": true
+    },
+    {
+      "id": "B0004",
+      "timestamp": "2026-05-27T22:01:55.468018+00:00",
+      "reason": "sensor_off",
+      "note": "motion sensor ",
+      "read": true
+    },
+    {
+      "id": "B0005",
+      "timestamp": "2026-05-27T22:18:23.881722+00:00",
+      "reason": "survey_incomplete",
+      "note": "",
+      "read": true
+    }
+  ]
+}
