@@ -1,0 +1,32 @@
+{
+  "participants": {
+    "P001": {
+      "pin": "1234",
+      "floor_plan": "floorplan.png",
+      "sensors": [
+        { "id": "motion",              "label": "Motion Sensor",          "consented": true  },
+        { "id": "bed_sensor",          "label": "Bed Sensor",             "consented": true  },
+        { "id": "depth_camera",        "label": "Depth Camera",           "consented": true  },
+        { "id": "wyze_camera",         "label": "WYZE Camera",            "consented": true  },
+        { "id": "vibration",           "label": "Vibration Sensor",       "consented": false },
+        { "id": "pressure",            "label": "Pressure Sensor",        "consented": true  },
+        { "id": "light_temperature",   "label": "Light & Temp Sensor",    "consented": true  },
+        { "id": "surface_temperature", "label": "Surface Temp Logger",    "consented": false },
+        { "id": "smart_plug",          "label": "Smart Plug",             "consented": true  },
+        { "id": "heartrate",           "label": "Wearable (Apple Watch)", "consented": true,  "wearable": true }
+      ]
+    },
+    "P002": {
+      "pin": "5678",
+      "floor_plan": "floorplan.png",
+      "sensors": [
+        { "id": "motion",       "label": "Motion Sensor",          "consented": true  },
+        { "id": "bed_sensor",   "label": "Bed Sensor",             "consented": true  },
+        { "id": "depth_camera", "label": "Depth Camera",           "consented": false },
+        { "id": "wyze_camera",  "label": "WYZE Camera",            "consented": true  },
+        { "id": "pressure",     "label": "Pressure Sensor",        "consented": true  },
+        { "id": "heartrate",    "label": "Wearable (Apple Watch)", "consented": true,  "wearable": true }
+      ]
+    }
+  }
+}
