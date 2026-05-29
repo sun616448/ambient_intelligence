@@ -153,6 +153,13 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
+    fetch('/demo-data/sensors.json')
+      .then(r => r.json())
+      .then(results => results.forEach(data => handleUploadResult(data.sensor_id, data)))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     const fetchRequests = () => getResidentRequests().then(setRequests).catch(() => {});
     fetchRequests();
     const interval = setInterval(fetchRequests, 2 * 60 * 1000);
