@@ -147,13 +147,20 @@ export function SensorList({ sensors, requests, onSensorClick, onUploadResult })
 
       {/* Sensor cards */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '8px' }}>
-        {sensors
-          .filter(s => !s.wearable)
-          .sort((a, b) => (b.report ? 1 : 0) - (a.report ? 1 : 0))
-          .map(s => (
-            <SensorCard key={s.id} sensor={s} onClick={onSensorClick} />
-          ))}
-        <EmpaticaGroup sensors={sensors} onSensorClick={onSensorClick} />
+        {(() => {
+          const nonWearable = sensors.filter(s => !s.wearable);
+          const withData = nonWearable.filter(s => s.report);
+          const withoutData = nonWearable.filter(s => !s.report);
+          const empaticaHasData = sensors.some(s => s.wearable && s.report);
+          return (
+            <>
+              {withData.map(s => <SensorCard key={s.id} sensor={s} onClick={onSensorClick} />)}
+              {empaticaHasData && <EmpaticaGroup sensors={sensors} onSensorClick={onSensorClick} />}
+              {withoutData.map(s => <SensorCard key={s.id} sensor={s} onClick={onSensorClick} />)}
+              {!empaticaHasData && <EmpaticaGroup sensors={sensors} onSensorClick={onSensorClick} />}
+            </>
+          );
+        })()}
       </div>
 
       <ResidentRequestsTray requests={requests} />
