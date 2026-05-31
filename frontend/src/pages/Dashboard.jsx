@@ -7,7 +7,7 @@ import { SensorModal } from '../components/SensorModal/SensorModal';
 import { ParticipantPanel } from '../components/Participants/ParticipantPanel';
 import { ParticipantDetailsModal } from '../components/Participants/ParticipantDetailsModal';
 import { EnrollmentFlow } from '../components/Participants/EnrollmentFlow';
-import { SENSOR_DEFAULTS, deriveStatus } from '../config/sensorConfig';
+import { SENSOR_DEFAULTS, CAMERA_IDS, deriveStatus } from '../config/sensorConfig';
 import { A11Y_THEME } from '../styles/accessibilityTheme';
 
 const F = "'SF Pro Display', 'Helvetica Neue', sans-serif";
@@ -195,6 +195,7 @@ export default function Dashboard() {
   }, []);
 
   const handleUploadResult = (sensorId, data) => {
+    if (CAMERA_IDS.has(sensorId)) return;
     setSensors(prev => {
       const exists = prev.find(s => s.id === sensorId);
       const updated = {

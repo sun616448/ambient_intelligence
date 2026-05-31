@@ -3,7 +3,7 @@ import { format } from 'date-fns';
 import { SensorCard } from './SensorCard';
 import { ResidentRequestsTray } from './ResidentRequestsTray';
 import { UploadPanel } from './UploadPanel';
-import { EMPATICA_SIGNALS, STATUS_COLOR, STATUS_LABEL, CARD_BG } from '../../config/sensorConfig';
+import { EMPATICA_SIGNALS, STATUS_COLOR, STATUS_LABEL, CARD_BG, CAMERA_IDS } from '../../config/sensorConfig';
 import { A11Y_THEME } from '../../styles/accessibilityTheme';
 
 const F = "'SF Pro Display', 'Helvetica Neue', sans-serif";
@@ -148,7 +148,7 @@ export function SensorList({ sensors, requests, onSensorClick, onUploadResult })
       {/* Sensor cards */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '8px' }}>
         {(() => {
-          const nonWearable = sensors.filter(s => !s.wearable);
+          const nonWearable = sensors.filter(s => !s.wearable && !CAMERA_IDS.has(s.id));
           const withData = nonWearable.filter(s => s.report);
           const withoutData = nonWearable.filter(s => !s.report);
           const empaticaHasData = sensors.some(s => s.wearable && s.report);
