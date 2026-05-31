@@ -64,6 +64,9 @@ export const EMPATICA_SIGNALS = [
 ];
 
 
+// Sensors managed via their own apps — excluded from all researcher views.
+export const CAMERA_IDS = new Set(['wyze_camera', 'depth_camera']);
+
 export function deriveStatus(report) {
   if (!report) return 'offline';
   if (!report.live) return 'offline';
