@@ -6,7 +6,6 @@
       "sensors": [
         { "id": "motion",              "label": "Motion Sensor",          "consented": true  },
         { "id": "bed_sensor",          "label": "Bed Sensor",             "consented": true  },
-        { "id": "depth_camera",        "label": "Depth Camera",           "consented": true  },
         { "id": "wyze_camera",         "label": "WYZE Camera",            "consented": true  },
         { "id": "vibration",           "label": "Vibration Sensor",       "consented": false },
         { "id": "pressure",            "label": "Pressure Sensor",        "consented": true  },
@@ -22,7 +21,6 @@
       "sensors": [
         { "id": "motion",       "label": "Motion Sensor",          "consented": true  },
         { "id": "bed_sensor",   "label": "Bed Sensor",             "consented": true  },
-        { "id": "depth_camera", "label": "Depth Camera",           "consented": false },
         { "id": "wyze_camera",  "label": "WYZE Camera",            "consented": true  },
         { "id": "pressure",     "label": "Pressure Sensor",        "consented": true  },
         { "id": "heartrate",    "label": "Wearable (Apple Watch)", "consented": true,  "wearable": true }
