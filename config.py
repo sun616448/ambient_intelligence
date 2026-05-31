@@ -1,3 +1,14 @@
+"""
+Sensor configuration for the Ambient Intelligence Researcher Dashboard.
+This file contains the configuration for the sensors that are being monitored.
+It is used to define the expected interval, gap threshold, unit, value range,
+aggregation method, and display bin size for each sensor.
+It is also used to define the signal column and source file for each sensor.
+The signal column is the column in the CSV file that contains the sensor data.
+The source file is the suffix used in the filename (e.g. *_pulse-rate.csv).
+The absent_means_not_wearing flag is used to indicate that the sensor is not wearing the device.
+This is used to determine if the sensor is live or not.
+"""
 SENSOR_CONFIG = {
     "heartrate": {
         "expected_interval_sec": 5,
@@ -65,20 +76,17 @@ SENSOR_CONFIG = {
         "aggregation": "mean",
         "display_bin_sec": 60,
     },
-    "smart_plug": {
+
+    # Actigraph LEAP wristwatch — placeholder until CenterPoint export format is confirmed.
+    # CenterPoint typically exports 1-minute epoch CSVs. Signals include activity counts,
+    # heart rate (optical PPG), and sleep stages. Expand to per-signal entries (like Empatica)
+    # once actual export files are available and column names are known.
+    "actigraph": {
         "expected_interval_sec": 60,
-        "gap_threshold_sec": 600,
-        "unit": "binary",
-        "value_range": (0, 1),
-        "aggregation": "binary",
-        "display_bin_sec": 60,
-    },
-    "depth_camera": {
-        "expected_interval_sec": 30,
         "gap_threshold_sec": 300,
-        "unit": "events",
+        "unit": "counts",
         "value_range": (0, None),
-        "aggregation": "max",
+        "aggregation": "mean",
         "display_bin_sec": 60,
     },
 

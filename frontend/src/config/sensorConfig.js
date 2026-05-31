@@ -2,8 +2,7 @@
 // After the API loads, these are merged with live config data.
 export const SENSOR_DEFAULTS = [
   // Time-series sensors with floor plan positions
-  { id: 'wyze_camera',         name: 'WYZE Camera',              room: 'Various',        position: { x: 15, y: 20 } },
-  { id: 'depth_camera',        name: 'Depth Camera',             room: 'Living Room',    position: { x: 30, y: 44 } },
+
   { id: 'light_temperature',   name: 'Light & Temp Sensor',      room: 'Various',        position: { x: 28, y: 36 } },
   { id: 'bed_sensor',          name: 'Bed Sensor',               room: 'Bedroom',        position: { x: 76, y: 56 } },
   { id: 'vibration',           name: 'Vibration Sensor',         room: 'Various',        position: { x: 38, y: 30 } },
@@ -14,6 +13,7 @@ export const SENSOR_DEFAULTS = [
   { id: 'smart_plug',          name: 'Smart Plug',               room: 'Various',        position: { x: 40, y: 60 } },
 
   // No floor plan dot — wearable or infrastructure
+  { id: 'actigraph',           name: 'Actigraph LEAP',           room: 'Wearable',       position: { x: 65, y: 20 }, noFloorPlan: true },
   { id: 'wearable_light',      name: 'Wearable Light Sensor',    room: 'Wearable',       position: { x: 60, y: 20 }, noFloorPlan: true },
   { id: 'usb_power',           name: 'USB Power Cord',           room: 'Infrastructure', position: { x: 50, y: 50 }, noFloorPlan: true },
   { id: 'recording_signage',   name: 'Recording Signage',        room: 'Various',        position: { x: 50, y: 50 }, noFloorPlan: true },

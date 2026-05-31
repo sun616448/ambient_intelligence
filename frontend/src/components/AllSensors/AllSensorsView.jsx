@@ -17,8 +17,7 @@ const SENSOR_TYPE_MAP = {
   pressure:            'Pressure',
   surface_temperature: 'Environmental',
   smart_plug:          'Infrastructure',
-  depth_camera:        'Camera',
-  wyze_camera:         'Camera',
+
   usb_power:           'Infrastructure',
   recording_signage:   'Infrastructure',
 };
@@ -31,7 +30,6 @@ const TYPE_DOT = {
   Environmental:  '#34d399',
   Wearable:       '#e879f9',
   Pressure:       '#38bdf8',
-  Camera:         '#fbbf24',
   Infrastructure: '#94a3b8',
 };
 

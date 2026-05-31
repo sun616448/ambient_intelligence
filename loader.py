@@ -1,3 +1,11 @@
+"""
+Loader for the Ambient Intelligence Researcher Dashboard.
+This file contains the functions for loading the sensor data from the CSV files.
+It is used to load the sensor data from the CSV files and parse it into a pandas DataFrame.
+It is also used to parse the sensor data into a pandas DataFrame using the pandas read_csv function.
+When adding new sensor types, need to add a new function specific to the sensor to make sure 
+it parses correctly 
+"""
 import numpy as np
 import pandas as pd
 

@@ -28,7 +28,9 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def _lifespan(app):
     # On startup: re-populate _gcs_results from the bucket so the dashboard
-    # doesn't start blank after a server restart.
+    # doesn't start blank after a server restart. Runs in a daemon thread so
+    # the server accepts requests immediately while the scan runs in the background.
+    # The frontend's 2-min poll will pick up results as they land.
     if GCS_BUCKET := os.environ.get("GCS_BUCKET_NAME", "").strip():
         import threading
         def _sync():
@@ -130,8 +132,7 @@ class _BumpBody(BaseModel):
 # Both the researcher view and participant view read positions from here (via the API),
 # so a change in one place propagates to both.
 _SENSOR_POSITIONS = {
-    "wyze_camera":         {"x": 15, "y": 20},
-    "depth_camera":        {"x": 30, "y": 44},
+
     "light_temperature":   {"x": 28, "y": 36},
     "bed_sensor":          {"x": 76, "y": 56},
     "vibration":           {"x": 38, "y": 30},
@@ -356,6 +357,9 @@ async def analyze_empatica(
     try:
         df = parse_empatica_biomarker_csv(tmp_path, signal_col=cfg["signal_col"], sensor_id=signal_type)
 
+        # Anchor the window to the calendar day of the data, not just the data span.
+        # Empatica pre-fills all 1440 minute slots, so without a fixed window the
+        # completeness calculation would always read ~100% even on a partial day.
         win_start = win_end = None
         if not df.empty:
             day_str = df["timestamp"].min().strftime("%Y-%m-%d")
@@ -382,6 +386,9 @@ async def analyze_empatica_folder(files: List[UploadFile] = File(...)):
     suffix in SENSOR_CONFIG (e.g. '_pulse-rate.csv' → empatica_pulse_rate).
     Returns a dict of signal_type → gap report + readings + timeline.
     """
+    # Build a lookup from filename suffix → (sensor_type, config) so each uploaded
+    # file self-identifies by its name (e.g. "_pulse-rate.csv" → empatica_pulse_rate)
+    # without the caller having to specify the type for every file in the folder.
     source_map = {
         cfg["source_file"]: (stype, cfg)
         for stype, cfg in SENSOR_CONFIG.items()
@@ -625,8 +632,10 @@ def get_resident_requests():
         reader = csv.DictReader(io.StringIO(content))
         results = []
         for i, row in enumerate(reader):
-            # Build norm dict preferring non-empty values when headers repeat
-            # (e.g. "What issue are you experiencing?" appears twice in the form)
+            # Normalize all keys to lowercase and deduplicate repeated headers.
+            # The Google Form has several question variants depending on request type,
+            # so the same column header can appear multiple times. We keep the first
+            # non-empty value for each key.
             norm = {}
             for k, v in row.items():
                 if not k:
@@ -635,7 +644,10 @@ def get_resident_requests():
                 val = v.strip()
                 if key not in norm or (val and not norm[key]):
                     norm[key] = val
-            # Conditional description fields — pick the first non-empty one
+            # The form shows a different free-text question depending on the request type
+            # (issue, scheduling, etc). Walk through all possibilities and use the first
+            # one that has a value.
+
             description = next(
                 (norm.get(col, "") for col in [
                     "what issue are you experiencing?",
@@ -683,6 +695,8 @@ def get_participant_sensors(participant_id: str):
             **s,
             "position": _SENSOR_POSITIONS.get(s["id"]),
             "consented": p_consent.get(s["id"], s.get("consented", True)),
+            # status is None (not "offline") when consent is withdrawn — the participant
+            # app uses None to render a lock icon rather than a red offline dot.
             "status": _sensor_status.get(s["id"], "offline") if p_consent.get(s["id"], s.get("consented", True)) else None,
         }
         for s in pdata.get("sensors", [])
@@ -701,8 +715,11 @@ def update_consent(participant_id: str, sensor_id: str, body: _ConsentBody):
     _consent_overrides.setdefault(participant_id, {})[sensor_id] = body.consented
     pid_ts = _turned_off_timestamps.setdefault(participant_id, {})
     if body.consented:
+        # Clear the timestamp so the researcher view stops showing "turned off by participant".
         pid_ts.pop(sensor_id, None)
     else:
+        # Record when the participant toggled off — surfaced in the researcher view as
+        # "Turned off by participant at [time]" on the sensor card.
         pid_ts[sensor_id] = datetime.now(timezone.utc).isoformat()
     return {"participant_id": participant_id, "sensor_id": sensor_id, "consented": body.consented}
 
