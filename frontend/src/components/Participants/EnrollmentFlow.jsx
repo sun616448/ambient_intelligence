@@ -194,7 +194,21 @@ function Step1Form({ data, onChange }) {
 function Step2Form({ sensors, onChange }) {
   const [selectedId, setSelectedId] = useState(null);
   const [dragging, setDragging]     = useState(null);
-  const mapRef = useRef(null);
+  const [customImage, setCustomImage] = useState(null);
+  const [useCustom, setUseCustom]   = useState(false);
+  const mapRef   = useRef(null);
+  const fileRef  = useRef(null);
+
+  const handleImageUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    setCustomImage(url);
+    setUseCustom(true);
+    e.target.value = '';
+  };
+
+  const floorPlanSrc = useCustom && customImage ? customImage : '/floorplan.png';
 
   const toggle  = id => onChange(sensors.map(s => s.id === id ? { ...s, included: !s.included } : s));
   const setNote = (id, v) => onChange(sensors.map(s => s.id === id ? { ...s, placementNote: v } : s));
@@ -307,6 +321,28 @@ function Step2Form({ sensors, onChange }) {
 
       {/* ── Right: floor plan editor ── */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '10px', minWidth: 0 }}>
+
+        {/* Upload toggle row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 12px', background: '#111', border: '1px solid #1e1e1e', borderRadius: '7px' }}>
+          <Toggle on={useCustom} onToggle={() => {
+            if (useCustom) { setUseCustom(false); }
+            else if (customImage) { setUseCustom(true); }
+            else { fileRef.current?.click(); }
+          }} />
+          <span style={{ fontSize: FS, color: useCustom ? TEXT_PRIMARY : TEXT_MUTED, flex: 1 }}>
+            {useCustom && customImage ? 'Using uploaded floor plan' : 'Upload floor plan image (LiDAR scan)'}
+          </span>
+          <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleImageUpload} />
+          <button
+            onClick={() => fileRef.current?.click()}
+            style={{ background: 'transparent', border: '1px solid #272727', borderRadius: '5px', color: TEXT_MUTED, fontSize: FS, padding: '4px 10px', cursor: 'pointer', fontFamily: F, flexShrink: 0 }}
+            onMouseEnter={e => { e.currentTarget.style.borderColor = '#4ade80'; e.currentTarget.style.color = '#4ade80'; }}
+            onMouseLeave={e => { e.currentTarget.style.borderColor = '#272727'; e.currentTarget.style.color = TEXT_MUTED; }}
+          >
+            {customImage ? 'Replace' : 'Choose file'}
+          </button>
+        </div>
+
         <div style={{ fontSize: FS, textTransform: 'uppercase', letterSpacing: '0.1em', color: canPlace ? '#4ade80' : TEXT_MUTED }}>
           {canPlace
             ? `Placing: ${selectedSensor.name} — click map or drag dot`
@@ -333,9 +369,9 @@ function Step2Form({ sensors, onChange }) {
           }}
         >
           <img
-            src="/floorplan.png"
+            src={floorPlanSrc}
             alt="Floor plan"
-            style={{ width: '100%', height: '100%', objectFit: 'fill', display: 'block', pointerEvents: 'none' }}
+            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block', pointerEvents: 'none' }}
           />
 
           {floorPlanSensors.map(sensor => {

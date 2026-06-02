@@ -38,7 +38,7 @@ from config import SENSOR_CONFIG
 from gap_detector import check_file_presence, check_sensor_live, detect_gaps
 from loader import parse_empatica_biomarker_csv
 
-# Parser per sensor type, bound to the right signal_col from config.
+# Parser per sensor type, bound to the right signal_column from config.
 _ROUTES = {
     stype: partial(parse_empatica_biomarker_csv, signal_col=cfg["signal_col"], sensor_id=stype)
     for stype, cfg in SENSOR_CONFIG.items()
