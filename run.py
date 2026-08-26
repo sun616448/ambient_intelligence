@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 
 from config import SENSOR_CONFIG
 from gap_detector import check_sensor_live, detect_gaps
-from loader import parse_apple_watch_csv, parse_empatica_biomarker_csv, parse_geoscope_csv
+from loader import parse_apple_watch_csv, parse_empatica_biomarker_csv, parse_geoscope, parse_geoscope_csv
 from visualizer import plot_sparkline, plot_sparklines_grid, plot_timeline_comparison
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +41,7 @@ _SENSOR_ROUTES = {
         "gap_kwargs": {},
     },
     "vibration": {
-        "parser": parse_geoscope_csv,
+        "parser": parse_geoscope,
         "gap_kwargs": {"aggregated_interval_sec": 1},
     },
 }
@@ -66,12 +66,54 @@ for _stype, _cfg in SENSOR_CONFIG.items():
         _HEADER_SIGNATURES[_stype] = {_cfg["signal_col"]}
 
 
+def _detect_json_sensor_type(filepath):
+    """
+    Identify a JSON upload by its record shape.
+
+    The Geoscope gateway writes a list of {uuid, data, gain, timestamp}
+    records. Nothing else in the fleet uploads JSON yet, so one signature is
+    enough; add branches here as other gateways appear.
+    """
+    import json as _json
+
+    try:
+        with open(filepath) as f:
+            payload = _json.load(f)
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(payload, list) or not payload:
+        return None
+
+    first = payload[0]
+    if not isinstance(first, dict):
+        return None
+
+    if {"uuid", "data", "timestamp"} <= first.keys() and str(
+        first["uuid"]
+    ).upper().startswith("GEOSCOPE"):
+        return "vibration"
+
+    return None
+
+
 def detect_sensor_type(filepath):
-    """Return the sensor_type for a file by inspecting its header, or None if unrecognised."""
+    """Return the sensor_type for a file by inspecting its header, or None if unrecognised.
+
+    Signature columns are matched against the parsed column names, not as
+    substrings of the raw header line. Substring matching silently mis-detected
+    any signal whose column name contains a shorter one: "met" is inside
+    "accelerometers_std_g", so accelerometers-std files were read as
+    empatica_met, and whichever landed second overwrote the other's report.
+    """
+    if filepath.lower().endswith(".json"):
+        return _detect_json_sensor_type(filepath)
+
     with open(filepath) as f:
         header = f.readline()
+    columns = {col.strip().strip('"') for col in header.split(",")}
     for sensor_type, required_cols in _HEADER_SIGNATURES.items():
-        if all(col in header for col in required_cols):
+        if required_cols <= columns:
             return sensor_type
     return None
 

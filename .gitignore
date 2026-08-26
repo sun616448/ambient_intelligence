@@ -2,6 +2,17 @@
 .env
 .env.*
 
+# Service account keys — a committed key is a live credential to the
+# participant data bucket, readable in history even after deletion.
+key.json
+*-key.json
+service-account*.json
+*.pem
+
+# Participant roster — contains login PINs. Supplied to deployments via the
+# PARTICIPANT_CONFIG_JSON environment variable instead of being committed.
+participant_config.json
+
 # Claude Code
 CLAUDE.md
 .claude/
@@ -35,3 +46,5 @@ newplot/
 *.csv
 *.avro
 *.parquet
+.vercel
+.env*

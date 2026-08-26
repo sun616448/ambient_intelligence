@@ -1,0 +1,34 @@
+# The backend deployment only needs the Python modules at the repository root.
+# Both frontends are separate Vercel projects and must not be bundled into the
+# function, and the data directories would blow past the bundle size for no
+# reason — sensor data is read from the bucket at runtime, never from the image.
+
+frontend/
+frontend-participant/
+node_modules/
+
+data/
+plots/
+reports/
+newplot/
+tests/
+1/
+
+*.csv
+*.avro
+*.parquet
+*.ipynb
+
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+
+CLAUDE.md
+.claude/
+
+# Never bundle the participant roster into a deployment. It holds login
+# PINs and reaches the deployed API through PARTICIPANT_CONFIG_JSON.
+# Excluding it means a missing env var fails loudly at boot rather than
+# silently shipping PINs inside the function.
+participant_config.json

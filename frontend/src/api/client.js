@@ -49,6 +49,13 @@ export const getTurnedOffTimestamps = () =>
 export const getGcsResults = () =>
   fetch(`${BASE}/api/gcs/results`).then(r => r.json());
 
+// The polled results above omit raw_rows — up to 5000 rows per sensor, which
+// only the detail modal's collapsible table ever renders. Fetch them for one
+// sensor when that modal opens instead of every two minutes for every sensor.
+export const getGcsResult = (sensorId) =>
+  fetch(`${BASE}/api/gcs/results/${encodeURIComponent(sensorId)}`)
+    .then(r => (r.ok ? r.json() : null));
+
 export const getBumpsSummary = () =>
   fetch(`${BASE}/api/bumps/summary`).then(r => r.ok ? r.json() : {});
 

@@ -1,7 +1,9 @@
 import base64
+import binascii
 import csv
 import io
 import json
+import logging
 import os
 import tempfile
 import urllib.request
@@ -18,94 +20,96 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import gcs_store
+import redis_store
+import state
 from config import SENSOR_CONFIG
 from daily_check import run_daily_check
 from gap_detector import check_sensor_live, detect_gaps
 from loader import parse_apple_watch_csv, parse_empatica_biomarker_csv, parse_geoscope_csv
 
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+log = logging.getLogger("api")
+
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def _lifespan(app):
-    # On startup: re-populate _gcs_results from the bucket so the dashboard
-    # doesn't start blank after a server restart. Runs in a daemon thread so
-    # the server accepts requests immediately while the scan runs in the background.
-    # The frontend's 2-min poll will pick up results as they land.
-    if GCS_BUCKET := os.environ.get("GCS_BUCKET_NAME", "").strip():
-        import threading
-        def _sync():
-            try:
-                from google.cloud import storage as _gcs
-                client = _gcs.Client(project=os.environ.get("GCS_PROJECT_ID", "").strip() or None)
-                blobs = [b for b in client.list_blobs(GCS_BUCKET) if b.name.lower().endswith(".csv")]
-                for blob in blobs:
-                    tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-                    try:
-                        blob.download_to_filename(tmp.name)
-                        tmp.close()
-                        result = _analyze_file(tmp.name)
-                        _gcs_results[result["sensor_id"]] = result
-                    except Exception:
-                        pass
-                    finally:
-                        try: os.unlink(tmp.name)
-                        except Exception: pass
-            except Exception:
-                pass  # GCS unavailable at startup — dashboard will show empty until Pub/Sub fires
-        threading.Thread(target=_sync, daemon=True).start()
+    # There is deliberately no startup bucket scan any more.
+    #
+    # The old version spawned a thread that re-downloaded and re-analysed every
+    # CSV in the bucket, purely to refill an in-memory dict that a restart had
+    # emptied. That cannot work on a serverless host — there is no long-lived
+    # process for it to run in, and a cold start per request would re-scan the
+    # bucket every time.
+    #
+    # Analysis results now live in the bucket (see gcs_store.write_summary), so
+    # a fresh instance is already current the moment it boots. Re-analysis is
+    # driven by new files arriving, not by the server starting.
+    log.info(
+        "starting: state backend=%s bucket=%s",
+        state.backend_name(),
+        gcs_store.bucket_name() or "<unset>",
+    )
+    if not gcs_store.is_configured():
+        log.warning(
+            "GCS_BUCKET_NAME is not set — running with in-memory state. "
+            "Results and consent toggles will be lost on restart."
+        )
     yield
 
 app = FastAPI(title="Ambient Intelligence Sensor API", lifespan=_lifespan)
 
+# Once the API is reachable on the public internet, "*" means any page on any
+# site can call it from a visitor's browser. Set ALLOWED_ORIGINS to the two
+# frontend URLs in production; the wildcard default keeps local development and
+# the current deployments working unchanged.
+_ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Floor plan images ship inside the deployment bundle, so this only ever needs
+# to read. exist_ok is not enough on a read-only filesystem — makedirs still
+# raises if the directory is genuinely absent — so the mount is conditional.
 _FLOORPLANS_DIR = os.path.join(os.path.dirname(__file__), "floorplans")
-os.makedirs(_FLOORPLANS_DIR, exist_ok=True)
-app.mount("/floorplans", StaticFiles(directory=_FLOORPLANS_DIR), name="floorplans")
+try:
+    os.makedirs(_FLOORPLANS_DIR, exist_ok=True)
+except OSError as _e:
+    log.warning("floorplans directory is not writable: %s", _e)
 
-_PARTICIPANT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "participant_config.json")
-with open(_PARTICIPANT_CONFIG_PATH) as _f:
-    _PARTICIPANT_CONFIG = json.load(_f)
+if os.path.isdir(_FLOORPLANS_DIR):
+    app.mount("/floorplans", StaticFiles(directory=_FLOORPLANS_DIR), name="floorplans")
+else:
+    log.warning("no floorplans directory at %s — /floorplans not mounted", _FLOORPLANS_DIR)
 
-# In-memory sensor status store — updated whenever a file is analyzed.
-# Keys are sensor_id strings (e.g. "heartrate", "vibration").
-# Defaults to "offline" for any sensor not yet uploaded.
-_sensor_status: dict = {}
+# Loaded via state.load_participant_config so there is one reader: it prefers
+# the PARTICIPANT_CONFIG_JSON environment variable and falls back to the local
+# file. The roster holds participant login PINs and is therefore not committed.
+_PARTICIPANT_CONFIG = state.load_participant_config()
 
-# In-memory consent overrides — updated when participant toggles permission.
-# Shape: { participant_id: { sensor_id: bool } }
-# Seeded from participant_config.json on startup.
-_consent_overrides: dict = {
-    pid: {s["id"]: s.get("consented", True) for s in pdata.get("sensors", [])}
-    for pid, pdata in _PARTICIPANT_CONFIG["participants"].items()
-}
+# Sensor status, consent, turned-off timestamps, bumps and analysis results all
+# used to be module-level dicts here. They now live in state.py, which keeps
+# them in the bucket when one is configured and in memory when one is not.
+# See the module docstring there for why: a serverless instance starts empty,
+# so anything held at module scope is invisible to the next request.
 
-# Tracks when a participant actively turned a sensor off via the toggle.
-# Shape: { participant_id: { sensor_id: ISO-8601 UTC string } }
-# Only set on an explicit toggle-off; cleared on toggle-on; absent for never-consented sensors.
-_turned_off_timestamps: dict = {}
 
-# Bump (reminder) log — persisted to bumps.json so history survives server restarts.
-# Shape: { participant_id: [ { id, timestamp, reason, note, read } ] }
-_BUMPS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bumps.json")
-
-def _load_bumps() -> dict:
-    try:
-        with open(_BUMPS_PATH) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def _save_bumps(data: dict):
-    with open(_BUMPS_PATH, "w") as f:
-        json.dump(data, f, indent=2)
-
-_bumps: dict = _load_bumps()
+def _sensor_status_map() -> dict:
+    """Latest status per sensor_id, derived from the stored summaries."""
+    return {
+        sensor_id: _derive_status(envelope)
+        for sensor_id, envelope in state.read_summary_index().items()
+    }
 
 
 def _derive_status(report: dict) -> str:
@@ -279,6 +283,36 @@ def _analyze(df, cfg, gap_kwargs=None):
     return report
 
 
+def _persist_envelope(report: dict, df, cfg: dict, extra: dict | None = None) -> dict:
+    """
+    Assemble the standard response envelope and store it.
+
+    Every path that analyses a file ends here — a researcher upload, a Pub/Sub
+    notification, a bucket sync — so all three behave the same way: the result
+    reaches the dashboard and survives a restart, rather than only existing in
+    the response to whoever triggered it.
+    """
+    envelope = {
+        **serialize_report(report),
+        "readings": build_readings(df, cfg),
+        "timeline": build_timeline(report),
+        "raw_rows": build_raw_rows(df),
+        **(extra or {}),
+    }
+
+    try:
+        state.put_summary(report["sensor_id"], envelope)
+    except Exception as e:
+        # The caller already waited for this analysis; hand it back even if it
+        # could not be stored. But record the failure on the envelope as well as
+        # in the logs — a sync that stores nothing must not report success, or
+        # the dashboard serves stale numbers with no indication anything broke.
+        log.exception("could not persist summary for %s", report["sensor_id"])
+        envelope["_persist_error"] = f"{type(e).__name__}: {e}".splitlines()[0][:300]
+
+    return envelope
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -308,11 +342,7 @@ async def analyze_apple_watch(file: UploadFile = File(...)):
         df = parse_apple_watch_csv(tmp_path)
         cfg = SENSOR_CONFIG["heartrate"]
         report = _analyze(df, cfg)
-        _sensor_status[report["sensor_id"]] = _derive_status(report)
-        timeline = build_timeline(report)
-        readings = build_readings(df, cfg)
-        raw_rows = build_raw_rows(df)
-        return {**serialize_report(report), "readings": readings, "timeline": timeline, "raw_rows": raw_rows}
+        return _persist_envelope(report, df, cfg)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -329,11 +359,7 @@ async def analyze_geoscope(file: UploadFile = File(...)):
         cfg = SENSOR_CONFIG["vibration"]
         # parse_geoscope_csv already bins to 1-second RMS; pass that as the effective interval
         report = _analyze(df, cfg, gap_kwargs={"aggregated_interval_sec": 1})
-        _sensor_status[report["sensor_id"]] = _derive_status(report)
-        timeline = build_timeline(report)
-        readings = build_readings(df, cfg)
-        raw_rows = build_raw_rows(df)
-        return {**serialize_report(report), "readings": readings, "timeline": timeline, "raw_rows": raw_rows}
+        return _persist_envelope(report, df, cfg)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -367,11 +393,7 @@ async def analyze_empatica(
             win_end = win_start + pd.Timedelta(hours=24)
 
         report = _analyze(df, cfg, gap_kwargs={"window_start": win_start, "window_end": win_end})
-        _sensor_status[report["sensor_id"]] = _derive_status(report)
-        timeline = build_timeline(report)
-        readings = build_readings(df, cfg)
-        raw_rows = build_raw_rows(df)
-        return {**serialize_report(report), "readings": readings, "timeline": timeline, "raw_rows": raw_rows}
+        return _persist_envelope(report, df, cfg)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -424,11 +446,7 @@ async def analyze_empatica_folder(files: List[UploadFile] = File(...)):
                 win_end = win_start + pd.Timedelta(hours=24)
 
             report = _analyze(df, cfg, gap_kwargs={"window_start": win_start, "window_end": win_end})
-            _sensor_status[report["sensor_id"]] = _derive_status(report)
-            timeline = build_timeline(report)
-            readings = build_readings(df, cfg)
-            raw_rows = build_raw_rows(df)
-            signals[stype] = {**serialize_report(report), "readings": readings, "timeline": timeline, "raw_rows": raw_rows}
+            signals[stype] = _persist_envelope(report, df, cfg)
         except Exception as e:
             signals[stype] = {"error": str(e)}
         finally:
@@ -439,107 +457,123 @@ async def analyze_empatica_folder(files: List[UploadFile] = File(...)):
 
 _SHEET_URL = os.environ.get("RESIDENT_REQUESTS_SHEET_URL", "").strip()
 
-GCS_BUCKET = os.environ.get("GCS_BUCKET_NAME", "").strip()
-GCS_PROJECT = os.environ.get("GCS_PROJECT_ID", "").strip() or None
-
-# In-memory store for GCS-processed results. Keyed by sensor_id.
-# Polled by the dashboard every 2 min via GET /api/gcs/results.
-_gcs_results: dict = {}
-
-
 # ---------------------------------------------------------------------------
-# GCS helpers
+# GCS ingest
 # ---------------------------------------------------------------------------
+#
+# Three ways a file in the bucket becomes a dashboard entry, all landing in the
+# same _analyze_file -> _persist_envelope path:
+#
+#   POST /api/gcs/pubsub    a push notification, seconds after the file lands.
+#                           The primary path once deployed.
+#   POST /api/gcs/sync      scan the bucket. Incremental by default, so a repeat
+#                           run only picks up what changed. Used by the cron
+#                           reconciliation and by hand during local testing,
+#                           where Pub/Sub cannot reach a laptop.
+#   POST /api/gcs/analyze   one named file, for debugging a specific object.
 
-def _gcs_download(bucket_name: str, blob_path: str) -> str:
-    """Download a GCS blob to a temp file and return the temp path."""
-    from google.cloud import storage as _gcs
-    client = _gcs.Client(project=GCS_PROJECT)
-    blob = client.bucket(bucket_name).blob(blob_path)
-    suffix = os.path.splitext(blob_path)[1] or ".csv"
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-    blob.download_to_filename(tmp.name)
-    tmp.close()
-    return tmp.name
+
+def _require_bucket(override: str | None = None) -> str:
+    name = override or gcs_store.bucket_name()
+    if not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide ?bucket=... or set GCS_BUCKET_NAME in the environment",
+        )
+    return name
 
 
-def _analyze_file(tmp_path: str, sensor_type: str | None = None) -> dict:
+def _verify_pubsub_token(request: Request) -> None:
     """
-    Auto-detect sensor type (or use the provided one), run the full pipeline,
-    and return the same response envelope as the /api/analyze/* endpoints.
+    Reject Pub/Sub deliveries that did not come from Google.
+
+    Without this the endpoint is an open write to the dashboard: anyone who
+    learns the URL can POST a crafted message and have the server fetch and
+    publish an arbitrary object as sensor data. That was tolerable while the API
+    only listened on localhost and is not once it is on the public internet.
+
+    Configure the push subscription with an OIDC service account and set
+    PUBSUB_AUDIENCE to the endpoint URL. If PUBSUB_VERIFY is explicitly set to
+    "0", verification is skipped — only appropriate for local testing.
     """
-    from run import detect_sensor_type, _SENSOR_ROUTES
+    if os.environ.get("PUBSUB_VERIFY", "1") == "0":
+        log.warning("Pub/Sub token verification is disabled (PUBSUB_VERIFY=0)")
+        return
 
-    if sensor_type is None:
-        sensor_type = detect_sensor_type(tmp_path)
-        if sensor_type is None:
-            raise ValueError(
-                "Could not auto-detect sensor type from file headers. "
-                "Pass ?sensor_type=heartrate (or other type) to override."
-            )
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
 
-    if sensor_type not in SENSOR_CONFIG:
-        raise ValueError(f"Unknown sensor_type: {sensor_type}")
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="google-auth is required to verify Pub/Sub tokens",
+        )
 
-    cfg = SENSOR_CONFIG[sensor_type]
-    route = _SENSOR_ROUTES[sensor_type]
-    df = route["parser"](tmp_path)
+    audience = os.environ.get("PUBSUB_AUDIENCE", "").strip() or None
+    try:
+        claims = id_token.verify_oauth2_token(
+            auth.removeprefix("Bearer "), google_requests.Request(), audience
+        )
+    except ValueError as e:
+        log.warning("rejected Pub/Sub delivery: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    gap_kwargs = dict(route.get("gap_kwargs", {}))
-    if sensor_type.startswith("empatica_") and not df.empty:
-        day_str = df["timestamp"].min().strftime("%Y-%m-%d")
-        win_start = pd.Timestamp(f"{day_str}T00:00:00Z")
-        gap_kwargs.update(window_start=win_start, window_end=win_start + pd.Timedelta(hours=24))
-
-    report = _analyze(df, cfg, gap_kwargs=gap_kwargs)
-    _sensor_status[report["sensor_id"]] = _derive_status(report)
-    return {
-        **serialize_report(report),
-        "readings": build_readings(df, cfg),
-        "timeline": build_timeline(report),
-        "raw_rows": build_raw_rows(df),
-        "detected_sensor_type": sensor_type,
-    }
+    expected_sa = os.environ.get("PUBSUB_SERVICE_ACCOUNT", "").strip()
+    if expected_sa and claims.get("email") != expected_sa:
+        log.warning("rejected Pub/Sub delivery from %s", claims.get("email"))
+        raise HTTPException(status_code=403, detail="Unexpected service account")
 
 
-# ---------------------------------------------------------------------------
-# GCS endpoints
-# ---------------------------------------------------------------------------
+def _process_blob(blob_name: str, bucket_override: str | None = None) -> dict:
+    """Download one blob, analyse it, store the result. Temp file always removed."""
+    tmp_path = gcs_store.download_to_temp(blob_name, bucket_override=bucket_override)
+    try:
+        return _analyze_file(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
 
 @app.post("/api/gcs/analyze")
 def gcs_analyze(
-    bucket: str = Query(default=None, description="GCS bucket name (overrides GCS_BUCKET_NAME env var)"),
-    file: str = Query(..., description="Path to the file inside the bucket, e.g. P001/2026-05-22/heartrate.csv"),
-    sensor_type: str = Query(default=None, description="Force sensor type; auto-detected from headers if omitted"),
+    bucket: str = Query(default=None, description="GCS bucket name (overrides GCS_BUCKET_NAME)"),
+    file: str = Query(..., description="Path to the file inside the bucket"),
+    sensor_type: str = Query(default=None, description="Override auto-detection"),
 ):
-    """
-    Download a file from GCS and run the gap analysis pipeline on it.
-    Use this to test GCS integration: upload a file to your bucket, then call this endpoint.
-    """
-    bucket_name = bucket or GCS_BUCKET
-    if not bucket_name:
-        raise HTTPException(status_code=400, detail="Provide ?bucket=... or set GCS_BUCKET_NAME in .env")
-    tmp_path = _gcs_download(bucket_name, file)
+    """Analyse one named object. Useful for checking a specific file by hand."""
+    bucket_name = _require_bucket(bucket)
+    tmp_path = gcs_store.download_to_temp(file, bucket_override=bucket_name)
     try:
         result = _analyze_file(tmp_path, sensor_type=sensor_type)
-        _gcs_results[result["sensor_id"]] = result
-        return result
+        return {"status": "processed", "bucket": bucket_name, "file": file, **result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        os.unlink(tmp_path)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 @app.post("/api/gcs/pubsub")
 async def gcs_pubsub(request: Request):
     """
-    Webhook for GCS Pub/Sub push notifications.
-    Wire this up in Google Cloud Console:
-      GCS bucket → Pub/Sub topic → push subscription → POST /api/gcs/pubsub
-    The endpoint auto-processes any .csv file that lands in the bucket.
+    Push endpoint for GCS object notifications.
+
+        bucket -> Pub/Sub topic -> push subscription -> POST here
+
+    Returns 2xx for messages it deliberately ignores (non-CSV, reserved paths),
+    because a non-2xx tells Pub/Sub to redeliver, and retrying a file that will
+    never be processable just loops.
     """
+    _verify_pubsub_token(request)
+
     body = await request.json()
     message = body.get("message", {})
     data_b64 = message.get("data", "")
@@ -548,7 +582,7 @@ async def gcs_pubsub(request: Request):
 
     try:
         data = json.loads(base64.b64decode(data_b64).decode("utf-8"))
-    except Exception:
+    except (binascii.Error, ValueError, UnicodeDecodeError):
         return {"status": "ignored", "reason": "could not decode message"}
 
     bucket_name = data.get("bucket")
@@ -557,68 +591,334 @@ async def gcs_pubsub(request: Request):
     if not bucket_name or not blob_path:
         return {"status": "ignored", "reason": "missing bucket or name in message"}
 
+    # Writing a summary triggers another notification for that summary object.
+    # Skipping reserved paths is what stops the bucket notifying itself in a loop.
+    if gcs_store.is_reserved(blob_path):
+        return {"status": "ignored", "reason": "reserved path"}
+
     if not blob_path.lower().endswith(".csv"):
         return {"status": "ignored", "reason": f"not a CSV: {blob_path}"}
 
-    tmp_path = _gcs_download(bucket_name, blob_path)
     try:
-        result = _analyze_file(tmp_path)
-        _gcs_results[result["sensor_id"]] = result
-        return {"status": "processed", "bucket": bucket_name, "file": blob_path, "sensor_type": result.get("detected_sensor_type")}
+        result = _process_blob(blob_path, bucket_override=bucket_name)
     except ValueError as e:
+        # Unrecognised format. Redelivering will not help, so acknowledge it.
+        log.info("skipping %s: %s", blob_path, e)
         return {"status": "skipped", "reason": str(e), "file": blob_path}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        os.unlink(tmp_path)
+    except Exception:
+        # A transient fault. Fail loudly so Pub/Sub retries.
+        log.exception("failed to process %s", blob_path)
+        raise HTTPException(status_code=500, detail=f"failed to process {blob_path}")
+
+    log.info("processed %s as %s", blob_path, result.get("detected_sensor_type"))
+    return {
+        "status": "processed",
+        "bucket": bucket_name,
+        "file": blob_path,
+        "sensor_type": result.get("detected_sensor_type"),
+    }
 
 
 @app.get("/api/gcs/results")
 def get_gcs_results():
-    """Return all GCS-processed sensor results. Polled by the dashboard every 2 min."""
-    return _gcs_results
+    """
+    Every analysed sensor, keyed by sensor_id. Polled by the dashboard.
+
+    raw_rows is deliberately absent — see /api/gcs/results/{sensor_id}.
+    """
+    try:
+        return state.read_summary_index()
+    except Exception:
+        log.exception("could not read summary index")
+        raise HTTPException(status_code=502, detail="Could not read stored summaries")
+
+
+@app.get("/api/gcs/results/{sensor_id}")
+def get_gcs_result(sensor_id: str):
+    """
+    One sensor's full envelope, including raw_rows.
+
+    raw_rows runs to 5000 rows per sensor and is only rendered in the detail
+    modal's collapsible table, so it is fetched when that modal opens rather
+    than included in the poll that runs every two minutes for every sensor.
+    """
+    try:
+        envelope = state.read_summary(sensor_id)
+    except Exception:
+        log.exception("could not read summary for %s", sensor_id)
+        raise HTTPException(status_code=502, detail="Could not read stored summary")
+
+    if envelope is None:
+        raise HTTPException(status_code=404, detail=f"No stored result for {sensor_id}")
+    return envelope
 
 
 @app.post("/api/gcs/sync")
 def gcs_sync(
     bucket: str = Query(default=None, description="GCS bucket (overrides GCS_BUCKET_NAME)"),
     prefix: str = Query(default="", description="Only process files under this prefix"),
+    full: bool = Query(default=False, description="Re-process every file, ignoring the watermark"),
 ):
     """
-    Scan the bucket for all CSV files and process any that can be auto-detected.
-    Call this after uploading a batch of files to sync everything at once.
-    """
-    bucket_name = bucket or GCS_BUCKET
-    if not bucket_name:
-        raise HTTPException(status_code=400, detail="Provide ?bucket=... or set GCS_BUCKET_NAME in .env")
+    Scan the bucket and process sensor CSVs.
 
-    from google.cloud import storage as _gcs
-    client = _gcs.Client(project=GCS_PROJECT)
-    blobs = [b for b in client.list_blobs(bucket_name, prefix=prefix) if b.name.lower().endswith(".csv")]
+    Incremental by default: only objects modified since the last successful sync
+    are downloaded, so running this on a schedule stays cheap as the bucket
+    grows. Pass full=true to rebuild everything from scratch.
+    """
+    bucket_name = _require_bucket(bucket)
+    started_at = datetime.now(timezone.utc)
+
+    watermark = None if full else state.read_sync_watermark()
+    try:
+        blobs = gcs_store.list_csv_blobs(prefix=prefix, updated_after=watermark)
+    except Exception as e:
+        log.exception("could not list bucket %s", bucket_name)
+        raise HTTPException(status_code=502, detail=f"Could not list bucket: {e}")
 
     processed, skipped, errors = [], [], []
 
     for blob in blobs:
-        tmp_path = None
         try:
-            suffix = os.path.splitext(blob.name)[1] or ".csv"
-            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-            blob.download_to_filename(tmp.name)
-            tmp.close()
-            tmp_path = tmp.name
-
-            result = _analyze_file(tmp_path)
-            _gcs_results[result["sensor_id"]] = result
+            result = _process_blob(blob.name, bucket_override=bucket_name)
             processed.append({"file": blob.name, "sensor_type": result["detected_sensor_type"]})
         except ValueError as e:
             skipped.append({"file": blob.name, "reason": str(e)})
         except Exception as e:
+            log.exception("failed to process %s", blob.name)
             errors.append({"file": blob.name, "error": str(e)})
-        finally:
-            if tmp_path:
-                os.unlink(tmp_path)
 
-    return {"processed": processed, "skipped": skipped, "errors": errors}
+    # Only advance the watermark if nothing failed. Moving it past a file that
+    # errored would mean the next incremental run never retries it.
+    if not errors:
+        try:
+            state.write_sync_watermark(started_at)
+        except Exception:
+            log.exception("could not write sync watermark")
+
+    log.info(
+        "sync: %d processed, %d skipped, %d errors (incremental=%s)",
+        len(processed), len(skipped), len(errors), watermark is not None,
+    )
+    return {
+        "bucket": bucket_name,
+        "incremental": watermark is not None,
+        "considered": len(blobs),
+        "processed": processed,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+# GET as well as POST: platform schedulers (Vercel Cron, Cloud Scheduler's
+# default) issue a GET, while a human testing it by hand reaches for POST.
+@app.get("/api/cron/sync")
+@app.post("/api/cron/sync")
+def cron_sync(request: Request):
+    """
+    Scheduled reconciliation, invoked by the platform scheduler.
+
+    Pub/Sub is the primary ingest path; this catches anything a dropped or failed
+    delivery missed. Guarded by CRON_SECRET so a public URL is not an open
+    invitation to trigger a full bucket scan.
+    """
+    secret = os.environ.get("CRON_SECRET", "").strip()
+    if secret:
+        if request.headers.get("authorization") != f"Bearer {secret}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    else:
+        log.warning("CRON_SECRET is not set — /api/cron/sync is unauthenticated")
+
+    return gcs_sync(bucket=None, prefix="", full=False)
+
+
+@app.post("/api/gcs/sync-geoscope")
+def gcs_sync_geoscope(
+    window_hours: float = Query(2.0, description="How far back to analyse"),
+    max_files_per_sensor: int = Query(200, description="Cap on files pulled per sensor"),
+    upload_lag_minutes: float = Query(20.0, description="Allowance for gateway upload delay"),
+):
+    """
+    Analyse a rolling window of Geoscope uploads, one report per device.
+
+    The gateway writes a file roughly every two minutes, so a file is not a
+    dataset the way a CSV export is — treating each one separately would give
+    every sensor a two-minute report that the next file immediately overwrote.
+    Instead the files covering the window are concatenated and analysed once, and
+    completeness is measured against the window rather than the file.
+
+    The window is also the cost control. There are ~68,000 objects and 19 GB in
+    this bucket; a full sweep is not something a request should ever attempt.
+    """
+    if not gcs_store.is_configured():
+        raise HTTPException(status_code=400, detail="GCS_BUCKET_NAME is not set")
+
+    from loader import parse_geoscope_json
+
+    window_end = datetime.now(timezone.utc)
+    window_start = window_end - pd.Timedelta(hours=window_hours)
+
+    # Files are selected by upload time but samples are filtered by the time they
+    # were recorded, and the gateway uploads several minutes after the fact. Cast
+    # a wider net when listing so the window is fully covered at both ends;
+    # without this the first minutes of the window sit in a file uploaded before
+    # window_start and are missed, which reads as data loss that never happened.
+    upload_lookback = pd.Timedelta(minutes=upload_lag_minutes)
+    grouped = gcs_store.list_recent_geoscope_blobs(
+        window_start - upload_lookback, window_end
+    )
+    if not grouped:
+        return {
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "sensors": {},
+            "note": "no Geoscope uploads in this window",
+        }
+
+    cfg = SENSOR_CONFIG["vibration"]
+    results, truncated = {}, {}
+
+    for sensor_dir, blobs in sorted(grouped.items()):
+        if len(blobs) > max_files_per_sensor:
+            truncated[sensor_dir] = {"available": len(blobs), "used": max_files_per_sensor}
+            blobs = blobs[-max_files_per_sensor:]   # keep the most recent
+
+        frames, failed = [], 0
+        for blob in blobs:
+            tmp = gcs_store.download_to_temp(blob.name)
+            try:
+                frames.append(parse_geoscope_json(tmp))
+            except Exception:
+                failed += 1
+                log.exception("could not parse %s", blob.name)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+        frames = [f for f in frames if not f.empty]
+        if not frames:
+            results[sensor_dir] = {"error": "no parseable files", "files": len(blobs)}
+            continue
+
+        df = pd.concat(frames, ignore_index=True).sort_values("timestamp")
+        df = df[(df["timestamp"] >= window_start) & (df["timestamp"] <= window_end)]
+        if df.empty:
+            results[sensor_dir] = {"error": "no samples inside window", "files": len(blobs)}
+            continue
+
+        # The tail of the window has not been uploaded yet, so measuring
+        # completeness against wall-clock `now` would charge every sensor for the
+        # gateway's upload delay and report a healthy device at ~80%. Completeness
+        # is measured up to the newest sample actually in hand; whether the sensor
+        # has stopped is what `live` and `lag_sec` are for, and they still compare
+        # against real time.
+        latest_sample = df["timestamp"].max()
+        effective_end = min(window_end, latest_sample)
+        upload_lag_sec = (window_end - latest_sample).total_seconds()
+
+        report = _analyze(
+            df, cfg,
+            gap_kwargs={
+                "aggregated_interval_sec": 1,
+                "window_start": window_start,
+                "window_end": effective_end,
+            },
+        )
+        envelope = _persist_envelope(report, df, cfg, extra={"detected_sensor_type": "vibration"})
+        results[sensor_dir] = {
+            "sensor_id": report["sensor_id"],
+            "stored": "_persist_error" not in envelope,
+            **({"store_error": envelope["_persist_error"]} if "_persist_error" in envelope else {}),
+            "files": len(blobs),
+            "unparseable_files": failed,
+            "rows": len(df),
+            "analysed_through": effective_end.isoformat(),
+            "upload_lag_sec": round(upload_lag_sec, 1),
+            "data_completeness_pct": report["data_completeness_pct"],
+            "gap_count": report["gap_count"],
+            "longest_gap_sec": report["longest_gap_sec"],
+            "live": report["live"],
+            "lag_sec": report["lag_sec"],
+        }
+
+    log.info("geoscope sync: %d sensors over %sh", len(results), window_hours)
+    return {
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "window_hours": window_hours,
+        "sensors": results,
+        # Surfaced rather than silently dropped: a capped sensor is reporting on
+        # less than the window asked for.
+        "truncated": truncated,
+    }
+
+
+@app.post("/api/gcs/reindex")
+def gcs_reindex():
+    """Rebuild _summaries/_index.json from the per-sensor objects."""
+    if not gcs_store.is_configured():
+        raise HTTPException(status_code=400, detail="GCS_BUCKET_NAME is not set")
+    return gcs_store.rebuild_summary_index()
+
+
+@app.get("/api/gcs/status")
+def gcs_status():
+    """
+    Whether the GCS connection actually works, and why not if it does not.
+
+    The previous version swallowed every credential and bucket error silently,
+    so a wrong bucket name looked exactly like an empty bucket. This is the
+    first thing to call after setting the environment variables.
+    """
+    info = {
+        "configured": gcs_store.is_configured(),
+        "bucket": gcs_store.bucket_name(),
+        "project": gcs_store.project_id(),
+        # GCS is read-only in the default setup; state lives in Redis. This
+        # reports where state actually goes so a misconfiguration is visible
+        # here rather than as summaries that quietly never update.
+        "state": redis_store.ping() if state.using_redis() else {"backend": state.backend_name()},
+        "credentials": (
+            "GCS_CREDENTIALS_B64" if os.environ.get("GCS_CREDENTIALS_B64", "").strip()
+            else "GOOGLE_APPLICATION_CREDENTIALS" if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+            else "application-default"
+        ),
+    }
+
+    if not info["configured"]:
+        info["reachable"] = False
+        info["error"] = "GCS_BUCKET_NAME is not set"
+        return info
+
+    try:
+        # Scoped to a single day: this bucket holds ~68,000 objects and a full
+        # walk on a health check would take tens of seconds.
+        gateways = gcs_store.list_gateway_prefixes()
+        info["gateways"] = gateways
+        now = datetime.now(timezone.utc)
+        recent = gcs_store.list_recent_geoscope_blobs(
+            now - pd.Timedelta(hours=24), now, gateway_prefixes=gateways
+        )
+        info["reachable"] = True
+        info["sensors_last_24h"] = {k: len(v) for k, v in sorted(recent.items())}
+        newest = max((b for v in recent.values() for b in v),
+                     key=lambda b: b.updated, default=None)
+        info["newest_object"] = newest.name if newest else None
+        info["newest_object_at"] = newest.updated.isoformat() if newest else None
+        info["summarised_sensors"] = sorted(state.read_summary_index().keys())
+        # Only relevant when GCS is being used as the state store. With Redis
+        # holding state the GCS credential needs read access and nothing more.
+        if state.using_gcs():
+            info["write_access"] = gcs_store.check_write_access()
+        watermark = state.read_sync_watermark()
+        info["last_synced_at"] = watermark.isoformat() if watermark else None
+    except Exception as e:
+        info["reachable"] = False
+        info["error"] = f"{type(e).__name__}: {e}"
+
+    return info
 
 
 @app.get("/api/resident-requests")
@@ -689,7 +989,8 @@ def get_participant_sensors(participant_id: str):
     pdata = _PARTICIPANT_CONFIG["participants"].get(participant_id)
     if not pdata:
         raise HTTPException(status_code=404, detail="Participant not found")
-    p_consent = _consent_overrides.get(participant_id, {})
+    p_consent = state.read_consent()["overrides"].get(participant_id, {})
+    status_map = _sensor_status_map()
     sensors = [
         {
             **s,
@@ -697,7 +998,7 @@ def get_participant_sensors(participant_id: str):
             "consented": p_consent.get(s["id"], s.get("consented", True)),
             # status is None (not "offline") when consent is withdrawn — the participant
             # app uses None to render a lock icon rather than a red offline dot.
-            "status": _sensor_status.get(s["id"], "offline") if p_consent.get(s["id"], s.get("consented", True)) else None,
+            "status": status_map.get(s["id"], "offline") if p_consent.get(s["id"], s.get("consented", True)) else None,
         }
         for s in pdata.get("sensors", [])
     ]
@@ -712,23 +1013,19 @@ def get_participant_sensors(participant_id: str):
 def update_consent(participant_id: str, sensor_id: str, body: _ConsentBody):
     if participant_id not in _PARTICIPANT_CONFIG["participants"]:
         raise HTTPException(status_code=404, detail="Participant not found")
-    _consent_overrides.setdefault(participant_id, {})[sensor_id] = body.consented
-    pid_ts = _turned_off_timestamps.setdefault(participant_id, {})
-    if body.consented:
-        # Clear the timestamp so the researcher view stops showing "turned off by participant".
-        pid_ts.pop(sensor_id, None)
-    else:
-        # Record when the participant toggled off — surfaced in the researcher view as
-        # "Turned off by participant at [time]" on the sensor card.
-        pid_ts[sensor_id] = datetime.now(timezone.utc).isoformat()
+    # state.set_consent records the toggle and, when turning off, the moment it
+    # happened — the researcher view renders that as "Turned off by participant
+    # at [time]". Turning back on clears it.
+    state.set_consent(participant_id, sensor_id, body.consented)
     return {"participant_id": participant_id, "sensor_id": sensor_id, "consented": body.consented}
 
 
 @app.get("/api/consent-status")
 def get_consent_status():
+    consent = state.read_consent()
     result = {}
-    for pid, sensors in _consent_overrides.items():
-        ts_map = _turned_off_timestamps.get(pid, {})
+    for pid, sensors in consent["overrides"].items():
+        ts_map = consent["turned_off"].get(pid, {})
         result[pid] = {
             sid: {"consented": consented, "turned_off_at": ts_map.get(sid) if not consented else None}
             for sid, consented in sensors.items()
@@ -738,21 +1035,20 @@ def get_consent_status():
 
 @app.get("/api/turned-off-timestamps")
 def get_turned_off_timestamps():
-    return _turned_off_timestamps
+    return state.read_consent()["turned_off"]
 
 
 @app.post("/api/participant/{participant_id}/bump")
 def send_bump(participant_id: str, body: _BumpBody):
-    bumps_for_p = _bumps.setdefault(participant_id, [])
+    existing = state.read_bumps().get(participant_id, [])
     bump = {
-        "id": f"B{len(bumps_for_p) + 1:04d}",
+        "id": f"B{len(existing) + 1:04d}",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "reason": body.reason,
         "note": body.note,
         "read": False,
     }
-    bumps_for_p.append(bump)
-    _save_bumps(_bumps)
+    state.append_bump(participant_id, bump)
     return bump
 
 
@@ -760,15 +1056,14 @@ def send_bump(participant_id: str, body: _BumpBody):
 def get_bumps(participant_id: str):
     if participant_id not in _PARTICIPANT_CONFIG["participants"]:
         raise HTTPException(status_code=404, detail="Participant not found")
-    return list(reversed(_bumps.get(participant_id, [])))
+    return list(reversed(state.read_bumps().get(participant_id, [])))
 
 
 @app.patch("/api/participant/{participant_id}/bumps/{bump_id}/read")
 def mark_bump_read(participant_id: str, bump_id: str):
-    for b in _bumps.get(participant_id, []):
+    updated = state.mark_bump_read(participant_id, bump_id)
+    for b in updated.get(participant_id, []):
         if b["id"] == bump_id:
-            b["read"] = True
-            _save_bumps(_bumps)
             return b
     raise HTTPException(status_code=404, detail="Bump not found")
 
@@ -776,7 +1071,7 @@ def mark_bump_read(participant_id: str, bump_id: str):
 @app.get("/api/bumps/summary")
 def get_bumps_summary():
     result = {}
-    for pid, lst in _bumps.items():
+    for pid, lst in state.read_bumps().items():
         result[pid] = {
             "total": len(lst),
             "unread": sum(1 for b in lst if not b["read"]),

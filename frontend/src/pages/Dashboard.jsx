@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { getSensors, getResidentRequests, getConsentStatus, getGcsResults, getBumpsSummary } from '../api/client';
+import { getSensors, getResidentRequests, getConsentStatus, getGcsResults, getGcsResult, getBumpsSummary } from '../api/client';
 import { FloorPlan } from '../components/FloorPlan/FloorPlan';
 import { AllSensorsView } from '../components/AllSensors/AllSensorsView';
 import { SensorList } from '../components/Sidebar/SensorList';
@@ -234,6 +234,26 @@ export default function Dashboard() {
   }, [sensors, selectedPId, consentStatus]);
 
   const selectedData = selectedSensor ? displaySensors.find(s => s.id === selectedSensor.id) : null;
+
+  // raw_rows is stripped from the polled results, so pull it in for just the
+  // open sensor. Skipped when the upload response already carried the rows.
+  useEffect(() => {
+    if (!selectedSensor) return;
+    const sensorId = selectedSensor.id;
+    const current = displaySensors.find(s => s.id === sensorId);
+    if (!current?.report || current.rawRows?.length) return;
+
+    let cancelled = false;
+    getGcsResult(sensorId)
+      .then(full => {
+        if (cancelled || !full?.raw_rows?.length) return;
+        setSensors(prev => prev.map(s =>
+          s.id === sensorId ? { ...s, rawRows: full.raw_rows } : s
+        ));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [selectedSensor]);
 
   const handleEditStart = () => {
     if (!selectedData) return;
